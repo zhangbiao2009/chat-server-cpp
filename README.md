@@ -1,4 +1,4 @@
-# Chat Server C++ Project
+# A Tiny, Fast C++ Chat Server
 
 This project implements a simple chat server in C++. The server is designed to handle multiple clients using asynchronous I/O with the epoll mechanism. Below are the details on how to build and run the application.
 
