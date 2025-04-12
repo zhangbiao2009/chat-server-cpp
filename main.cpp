@@ -33,7 +33,7 @@ private:
         static std::random_device rd;
         static std::mt19937 gen(rd());
         static std::uniform_int_distribution<> dist(0, chars.size() - 1);
-        
+
         std::string result(length, ' ');
         for (int i = 0; i < length; i++) {
             result[i] = chars[dist(gen)];
@@ -73,35 +73,35 @@ public:
     void sendMessage(int senderFd, const std::string& message) {
         std::lock_guard<std::mutex> lock(mutex);
         std::string senderNick;
-        
+
         if (clients.find(senderFd) != clients.end()) {
             senderNick = clients[senderFd]->nick;
         } else {
             return;
         }
-        
+
         std::string fullMessage = senderNick + ": " + message;
-        
+
         for (auto& pair : clients) {
             if (pair.first != senderFd) {
                 send(pair.first, fullMessage.c_str(), fullMessage.size(), 0);
             }
         }
     }
-    
+
     bool handleCommand(int fd, const std::string& command) {
         if (command.empty() || command[0] != '/') {
             return false;
         }
-        
+
         size_t spacePos = command.find(' ');
         if (spacePos == std::string::npos) {
             return true;  // Just a command without arguments
         }
-        
+
         std::string cmd = command.substr(0, spacePos);
         std::string args = command.substr(spacePos + 1);
-        
+
         if (cmd == "/nick") {
             std::lock_guard<std::mutex> lock(mutex);
             if (clients.find(fd) != clients.end()) {
@@ -111,10 +111,10 @@ public:
             }
             return true;
         }
-        
+
         return true;
     }
-    
+
     Client* getClient(int fd) {
         std::lock_guard<std::mutex> lock(mutex);
         auto it = clients.find(fd);
@@ -128,46 +128,128 @@ void setNonBlocking(int sockfd) {
     fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
 }
 
+// Handle new client connection
+void handleNewConnection(int serverFd, int epollFd, ClientManager& clientManager) {
+    struct sockaddr_in clientAddr;
+    socklen_t clientAddrLen = sizeof(clientAddr);
+    int clientFd = accept(serverFd, (struct sockaddr*)&clientAddr, &clientAddrLen);
+
+    if (clientFd < 0) {
+        std::cerr << "Accept failed" << std::endl;
+        return;
+    }
+
+    setNonBlocking(clientFd);
+
+    // Add client socket to epoll
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLET;  // Edge triggered
+    ev.data.fd = clientFd;
+    if (epoll_ctl(epollFd, EPOLL_CTL_ADD, clientFd, &ev) < 0) {
+        std::cerr << "Failed to add client socket to epoll" << std::endl;
+        close(clientFd);
+        return;
+    }
+
+    Client* client = new Client(clientFd);
+    clientManager.addClient(client);
+}
+
+// Process a single line from client
+void processClientLine(int clientFd, const std::string& line, ClientManager& clientManager) {
+    if (!line.empty() && line[0] == '/') {
+        clientManager.handleCommand(clientFd, line);
+    } else {
+        clientManager.sendMessage(clientFd, line);
+    }
+}
+
+// Handle client disconnection
+void handleClientDisconnection(int clientFd, int epollFd, ClientManager& clientManager) {
+    epoll_ctl(epollFd, EPOLL_CTL_DEL, clientFd, nullptr);
+    clientManager.removeClient(clientFd);
+}
+
+// Handle client data received
+void handleClientData(int clientFd, int epollFd, char* buffer, size_t bufferSize, ClientManager& clientManager) {
+    ssize_t bytesRead = read(clientFd, buffer, bufferSize - 1);
+
+    if (bytesRead <= 0) {
+        // Connection closed or error
+        if (bytesRead < 0) {
+            std::cerr << "Read error" << std::endl;
+        }
+        handleClientDisconnection(clientFd, epollFd, clientManager);
+        return;
+    }
+
+    buffer[bytesRead] = '\0';
+
+    Client* client = clientManager.getClient(clientFd);
+    if (!client) {
+        return;
+    }
+
+    // Append to client buffer and process lines
+    client->buffer += buffer;
+
+    // Process complete lines
+    size_t pos;
+    while ((pos = client->buffer.find('\n')) != std::string::npos) {
+        std::string line = client->buffer.substr(0, pos);
+        // Remove possible \r
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+
+        client->buffer = client->buffer.substr(pos + 1);
+        std::cout << "Received: " << line << std::endl;
+
+        processClientLine(clientFd, line, clientManager);
+    }
+}
+
+
 int main() {
     const int PORT = 12345;
     const int MAX_EVENTS = 64;
     const int MAX_BUFFER_SIZE = 1024;
-    
+
     // Create socket
     int serverFd = socket(AF_INET, SOCK_STREAM, 0);
     if (serverFd < 0) {
         std::cerr << "Failed to create socket" << std::endl;
         return 1;
     }
-    
+
     // Set socket options
     int opt = 1;
     setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
+
     // Set to non-blocking mode
     setNonBlocking(serverFd);
-    
+
     // Bind
     struct sockaddr_in address;
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(PORT);
-    
+
     if (bind(serverFd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         std::cerr << "Bind failed" << std::endl;
         close(serverFd);
         return 1;
     }
-    
+
     // Listen
     if (listen(serverFd, SOMAXCONN) < 0) {
         std::cerr << "Listen failed" << std::endl;
         close(serverFd);
         return 1;
     }
-    
+
     std::cout << "Server is listening on 127.0.0.1:" << PORT << std::endl;
-    
+
     // Create epoll instance
     int epollFd = epoll_create1(0);
     if (epollFd < 0) {
@@ -175,7 +257,7 @@ int main() {
         close(serverFd);
         return 1;
     }
-    
+
     // Add server socket to epoll
     struct epoll_event ev;
     ev.events = EPOLLIN;
@@ -186,98 +268,39 @@ int main() {
         close(epollFd);
         return 1;
     }
-    
+
     struct epoll_event events[MAX_EVENTS];
     char buffer[MAX_BUFFER_SIZE];
-    
+
     ClientManager clientManager;
-    
+
     while (true) {
         int numEvents = epoll_wait(epollFd, events, MAX_EVENTS, -1);
-        
+
         for (int i = 0; i < numEvents; i++) {
-            if (events[i].data.fd == serverFd) {
+            const int currentFd = events[i].data.fd;
+            const uint32_t currentEvents = events[i].events;
+
+            if (currentFd == serverFd) {
                 // New client connection
-                struct sockaddr_in clientAddr;
-                socklen_t clientAddrLen = sizeof(clientAddr);
-                int clientFd = accept(serverFd, (struct sockaddr*)&clientAddr, &clientAddrLen);
-                
-                if (clientFd < 0) {
-                    std::cerr << "Accept failed" << std::endl;
-                    continue;
-                }
-                
-                setNonBlocking(clientFd);
-                
-                // Add client socket to epoll
-                ev.events = EPOLLIN | EPOLLET;  // Edge triggered
-                ev.data.fd = clientFd;
-                if (epoll_ctl(epollFd, EPOLL_CTL_ADD, clientFd, &ev) < 0) {
-                    std::cerr << "Failed to add client socket to epoll" << std::endl;
-                    close(clientFd);
-                    continue;
-                }
-                
-                Client* client = new Client(clientFd);
-                clientManager.addClient(client);
+                handleNewConnection(serverFd, epollFd, clientManager);
             }
             else {
-                // Client socket is ready for reading
-                int clientFd = events[i].data.fd;
-                
-                if (events[i].events & EPOLLIN) {
-                    ssize_t bytesRead = read(clientFd, buffer, MAX_BUFFER_SIZE - 1);
-                    
-                    if (bytesRead <= 0) {
-                        // Connection closed or error
-                        if (bytesRead < 0) {
-                            std::cerr << "Read error" << std::endl;
-                        }
-                        epoll_ctl(epollFd, EPOLL_CTL_DEL, clientFd, nullptr);
-                        clientManager.removeClient(clientFd);
-                    }
-                    else {
-                        buffer[bytesRead] = '\0';
-                        
-                        Client* client = clientManager.getClient(clientFd);
-                        if (client) {
-                            // Append to client buffer and process lines
-                            client->buffer += buffer;
-                            
-                            // Process complete lines
-                            size_t pos;
-                            while ((pos = client->buffer.find('\n')) != std::string::npos) {
-                                std::string line = client->buffer.substr(0, pos);
-                                // Remove possible \r
-                                if (!line.empty() && line.back() == '\r') {
-                                    line.pop_back();
-                                }
-                                
-                                client->buffer = client->buffer.substr(pos + 1);
-                                
-                                std::cout << "Received: " << line << std::endl;
-                                
-                                if (!line.empty() && line[0] == '/') {
-                                    clientManager.handleCommand(clientFd, line);
-                                } else {
-                                    clientManager.sendMessage(clientFd, line);
-                                }
-                            }
-                        }
-                    }
+                // Client socket events
+                if (currentEvents & EPOLLIN) {
+                    handleClientData(currentFd, epollFd, buffer, MAX_BUFFER_SIZE, clientManager);
                 }
-                
-                if (events[i].events & (EPOLLERR | EPOLLHUP)) {
+
+                if (currentEvents & (EPOLLERR | EPOLLHUP)) {
                     // Error or hang up
-                    epoll_ctl(epollFd, EPOLL_CTL_DEL, clientFd, nullptr);
-                    clientManager.removeClient(clientFd);
+                    handleClientDisconnection(currentFd, epollFd, clientManager);
                 }
             }
         }
     }
-    
+
     close(epollFd);
     close(serverFd);
-    
+
     return 0;
 }
