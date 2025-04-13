@@ -13,10 +13,11 @@
 #include <cstring>
 #include <errno.h>
 
-// Constants for trySendData return values
-const int SEND_RESULT_ERROR = -1;    // Error occurred, connection should be closed
-const int SEND_RESULT_PENDING = 0;   // More data pending, socket buffer full
-const int SEND_RESULT_COMPLETE = 1;  // All data sent successfully
+enum class SendResult {
+    ERROR = -1,    // Error occurred, connection should be closed
+    PENDING = 0,   // More data pending, socket buffer full
+    COMPLETE = 1   // All data sent successfully
+};
 
 // Global epoll file descriptor for use in functions
 int g_epollFd = -1;
@@ -55,7 +56,7 @@ public:
     }
 
     // Try to send data from queue, returns status code indicating result
-    int trySendData() {
+    SendResult trySendData() {
         // If currentSendBuffer is empty but queue isn't, move a message to currentSendBuffer
         if (currentSendBuffer.empty() && !outgoingQueue.empty()) {
             currentSendBuffer = outgoingQueue.front();
@@ -63,30 +64,30 @@ public:
         }
 
         if (currentSendBuffer.empty()) {
-            return SEND_RESULT_COMPLETE; // No data to send, all done
+            return SendResult::COMPLETE; // No data to send, all done
         }
 
         ssize_t sent = send(fd, currentSendBuffer.c_str(), currentSendBuffer.size(), 0);
         if (sent < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return SEND_RESULT_PENDING; // Socket buffer full, try again later
+                return SendResult::PENDING; // Socket buffer full, try again later
             }
             // Other error with the TCP connection
             std::cerr << "Socket error on fd " << fd << ": " << strerror(errno) << std::endl;
-            return SEND_RESULT_ERROR; // Signal that connection should be closed
+            return SendResult::ERROR; // Signal that connection should be closed
         }
 
         // If we sent part of the message, keep the rest for later
         if (static_cast<size_t>(sent) < currentSendBuffer.size()) {
             currentSendBuffer = currentSendBuffer.substr(sent);
-            return SEND_RESULT_PENDING; // More data pending
+            return SendResult::PENDING; // More data pending
         }
 
         // Message completely sent
         currentSendBuffer.clear();
 
         // Check if there's more in the queue
-        return outgoingQueue.empty() ? SEND_RESULT_COMPLETE : SEND_RESULT_PENDING;
+        return outgoingQueue.empty() ? SendResult::COMPLETE : SendResult::PENDING;
     }
 
 private:
@@ -206,7 +207,7 @@ void updateClientEpollEvents(int clientFd, uint32_t events) {
     }
 }
 
-// Handle client data ready for sending
+// Handle client data ready for sending - updated to use enum class
 void handleClientWrite(int clientFd, ClientManager& clientManager) {
     Client* client = clientManager.getClient(clientFd);
     if (!client) {
@@ -214,16 +215,16 @@ void handleClientWrite(int clientFd, ClientManager& clientManager) {
     }
 
     // Try to send queued data
-    int result = client->trySendData();
+    SendResult result = client->trySendData();
 
-    if (result == SEND_RESULT_COMPLETE) {
+    if (result == SendResult::COMPLETE) {
         // All data sent, stop monitoring for EPOLLOUT
         updateClientEpollEvents(clientFd, EPOLLIN | EPOLLET);
-    } else if (result == SEND_RESULT_ERROR) {
+    } else if (result == SendResult::ERROR) {
         // Error occurred, close the connection
         handleClientDisconnection(clientFd, g_epollFd, clientManager);
     }
-    // If result == SEND_RESULT_PENDING, keep monitoring for EPOLLOUT
+    // If result == SendResult::PENDING, keep monitoring for EPOLLOUT
 }
 
 // Handle new client connection
