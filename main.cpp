@@ -2,21 +2,39 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <queue>
 #include <random>
 #include <algorithm>
-#include <mutex>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <cstring>
+#include <errno.h>
 
+// Constants for trySendData return values
+const int SEND_RESULT_ERROR = -1;    // Error occurred, connection should be closed
+const int SEND_RESULT_PENDING = 0;   // More data pending, socket buffer full
+const int SEND_RESULT_COMPLETE = 1;  // All data sent successfully
+
+// Global epoll file descriptor for use in functions
+int g_epollFd = -1;
+
+// Forward declarations
+class Client;
+class ClientManager;
+void handleClientDisconnection(int clientFd, int epollFd, ClientManager& clientManager);
+void updateClientEpollEvents(int clientFd, uint32_t events);
+
+// Client class definition
 class Client {
 public:
     int fd;
     std::string nick;
     std::string buffer;
+    std::queue<std::string> outgoingQueue;  // Queue for outgoing messages
+    std::string currentSendBuffer;         // Current message being sent
 
     Client(int fd) : fd(fd) {
         nick = generateRandomNick(4);
@@ -24,6 +42,51 @@ public:
 
     ~Client() {
         close(fd);
+    }
+
+    // Add a message to the outgoing queue
+    void queueMessage(const std::string& message) {
+        outgoingQueue.push(message);
+    }
+
+    // Check if client has pending data to send
+    bool hasDataToSend() const {
+        return !currentSendBuffer.empty() || !outgoingQueue.empty();
+    }
+
+    // Try to send data from queue, returns status code indicating result
+    int trySendData() {
+        // If currentSendBuffer is empty but queue isn't, move a message to currentSendBuffer
+        if (currentSendBuffer.empty() && !outgoingQueue.empty()) {
+            currentSendBuffer = outgoingQueue.front();
+            outgoingQueue.pop();
+        }
+
+        if (currentSendBuffer.empty()) {
+            return SEND_RESULT_COMPLETE; // No data to send, all done
+        }
+
+        ssize_t sent = send(fd, currentSendBuffer.c_str(), currentSendBuffer.size(), 0);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return SEND_RESULT_PENDING; // Socket buffer full, try again later
+            }
+            // Other error with the TCP connection
+            std::cerr << "Socket error on fd " << fd << ": " << strerror(errno) << std::endl;
+            return SEND_RESULT_ERROR; // Signal that connection should be closed
+        }
+
+        // If we sent part of the message, keep the rest for later
+        if (static_cast<size_t>(sent) < currentSendBuffer.size()) {
+            currentSendBuffer = currentSendBuffer.substr(sent);
+            return SEND_RESULT_PENDING; // More data pending
+        }
+
+        // Message completely sent
+        currentSendBuffer.clear();
+
+        // Check if there's more in the queue
+        return outgoingQueue.empty() ? SEND_RESULT_COMPLETE : SEND_RESULT_PENDING;
     }
 
 private:
@@ -42,10 +105,10 @@ private:
     }
 };
 
+// ClientManager class definition
 class ClientManager {
 private:
     std::unordered_map<int, Client*> clients;
-    std::mutex mutex;
 
 public:
     ~ClientManager() {
@@ -55,13 +118,11 @@ public:
     }
 
     void addClient(Client* client) {
-        std::lock_guard<std::mutex> lock(mutex);
         clients[client->fd] = client;
         std::cout << "Client added: " << client->nick << std::endl;
     }
 
     void removeClient(int fd) {
-        std::lock_guard<std::mutex> lock(mutex);
         if (clients.find(fd) != clients.end()) {
             std::string nick = clients[fd]->nick;
             delete clients[fd];
@@ -71,7 +132,6 @@ public:
     }
 
     void sendMessage(int senderFd, const std::string& message) {
-        std::lock_guard<std::mutex> lock(mutex);
         std::string senderNick;
 
         if (clients.find(senderFd) != clients.end()) {
@@ -80,11 +140,19 @@ public:
             return;
         }
 
-        std::string fullMessage = senderNick + ": " + message;
+        std::string fullMessage = senderNick + ": " + message + "\r\n";
 
         for (auto& pair : clients) {
             if (pair.first != senderFd) {
-                send(pair.first, fullMessage.c_str(), fullMessage.size(), 0);
+                Client* client = pair.second;
+
+                // Queue the message instead of sending immediately
+                client->queueMessage(fullMessage);
+
+                // If this is the first message in the queue, we need to register for EPOLLOUT
+                if (client->outgoingQueue.size() == 1 && client->currentSendBuffer.empty()) {
+                    updateClientEpollEvents(client->fd, EPOLLIN | EPOLLOUT | EPOLLET);
+                }
             }
         }
     }
@@ -103,7 +171,6 @@ public:
         std::string args = command.substr(spacePos + 1);
 
         if (cmd == "/nick") {
-            std::lock_guard<std::mutex> lock(mutex);
             if (clients.find(fd) != clients.end()) {
                 std::string oldNick = clients[fd]->nick;
                 clients[fd]->nick = args;
@@ -116,7 +183,6 @@ public:
     }
 
     Client* getClient(int fd) {
-        std::lock_guard<std::mutex> lock(mutex);
         auto it = clients.find(fd);
         return it != clients.end() ? it->second : nullptr;
     }
@@ -126,6 +192,38 @@ public:
 void setNonBlocking(int sockfd) {
     int flags = fcntl(sockfd, F_GETFL, 0);
     fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+}
+
+// Update epoll events for a client socket
+void updateClientEpollEvents(int clientFd, uint32_t events) {
+    struct epoll_event ev;
+    ev.events = events;
+    ev.data.fd = clientFd;
+
+    // Modify existing events
+    if (epoll_ctl(g_epollFd, EPOLL_CTL_MOD, clientFd, &ev) < 0) {
+        std::cerr << "Failed to modify epoll events for client: " << strerror(errno) << std::endl;
+    }
+}
+
+// Handle client data ready for sending
+void handleClientWrite(int clientFd, ClientManager& clientManager) {
+    Client* client = clientManager.getClient(clientFd);
+    if (!client) {
+        return;
+    }
+
+    // Try to send queued data
+    int result = client->trySendData();
+
+    if (result == SEND_RESULT_COMPLETE) {
+        // All data sent, stop monitoring for EPOLLOUT
+        updateClientEpollEvents(clientFd, EPOLLIN | EPOLLET);
+    } else if (result == SEND_RESULT_ERROR) {
+        // Error occurred, close the connection
+        handleClientDisconnection(clientFd, g_epollFd, clientManager);
+    }
+    // If result == SEND_RESULT_PENDING, keep monitoring for EPOLLOUT
 }
 
 // Handle new client connection
@@ -209,7 +307,6 @@ void handleClientData(int clientFd, int epollFd, char* buffer, size_t bufferSize
     }
 }
 
-
 int main() {
     const int PORT = 12345;
     const int MAX_EVENTS = 64;
@@ -258,6 +355,8 @@ int main() {
         return 1;
     }
 
+    g_epollFd = epollFd; // Set global epoll file descriptor
+
     // Add server socket to epoll
     struct epoll_event ev;
     ev.events = EPOLLIN;
@@ -289,6 +388,10 @@ int main() {
                 // Client socket events
                 if (currentEvents & EPOLLIN) {
                     handleClientData(currentFd, epollFd, buffer, MAX_BUFFER_SIZE, clientManager);
+                }
+
+                if (currentEvents & EPOLLOUT) {
+                    handleClientWrite(currentFd, clientManager);
                 }
 
                 if (currentEvents & (EPOLLERR | EPOLLHUP)) {
