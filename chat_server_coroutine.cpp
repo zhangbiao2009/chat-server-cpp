@@ -97,11 +97,11 @@ public:
 
             // Clean up coroutine
             if (read_handle_) {
-                read_handle_.destroy();
+                //read_handle_.destroy();       // note: do not destroy here, coroutine is managed by the task
                 read_handle_ = nullptr;
             }
 
-            client_task_.reset();
+            client_task_.reset();       // the coroutine will also be destroyed when the task is destroyed
             session_.reset();
         }
     }
@@ -259,7 +259,6 @@ Task handle_client(Client* client) {
         // Handle the events directly in the coroutine
         if (events & (EPOLLHUP | EPOLLERR)) {
             std::cerr << "[Debug] Client " << client->fd() << ": Disconnected: HUP/ERR" << std::endl;
-            client->close();
             co_return;
         }
 
@@ -268,7 +267,6 @@ Task handle_client(Client* client) {
             std::cout << "[Debug] Client " << client->fd() << ": Handling write" << std::endl;
             if (!client->write()) {
                 std::cerr << "[Debug] Client " << client->fd() << ": Write failed, closing" << std::endl;
-                client->close();
                 co_return;
             }
         }
@@ -278,7 +276,6 @@ Task handle_client(Client* client) {
             std::cout << "[Debug] Client " << client->fd() << ": Handling read" << std::endl;
             if (!client->read()) {
                 std::cerr << "[Debug] Client " << client->fd() << ": Read failed, closing" << std::endl;
-                client->close();
                 co_return;
             }
         }
@@ -370,11 +367,13 @@ public:
 
                     // Just resume the coroutine - it will handle the events
                     if (client->read_handle() && !client->read_handle().done()) {
+                        std::cout<< "[Debug] Resuming coroutine for client " << client->fd() << std::endl;
                         client->read_handle().resume();
                     }
 
                     // Clean up or completed clients
                     if ((client->read_handle() && client->read_handle().done())) {
+                        std::cout<< "[Debug] erasing client " << client->fd() << std::endl;
                         clients_.erase(client->fd());
                     }
                 }
