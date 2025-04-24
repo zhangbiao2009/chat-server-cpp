@@ -118,11 +118,11 @@ public:
         ev.data.ptr = this;
 
         if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd_, &ev) == -1) {
-            if (errno == EINVAL) {
+            if (errno == EINVAL || errno == ENOENT) {
                 // Not yet added, add instead
                 epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd_, &ev);
             } else {
-                std::cerr << "epoll_ctl failed: " << errno << '\n';
+                std::cerr << "epoll_ctl failed: " << strerror(errno) << ", fd_: "<< fd_<< std::endl;
             }
         }
     }
@@ -386,12 +386,13 @@ private:
             auto task_ptr = std::make_unique<Task>(handle_client(client.get()));
             client->set_task(std::move(task_ptr));
 
+            // Initial registration with epoll
+            client->register_epoll(false);
+
             // Add the client to our map
             clients_[client_fd] = std::move(client);
             std::cout << "New client connected: " << client_fd << std::endl;
 
-            // Initial registration with epoll
-            client->register_epoll(false);
         }
     }
 
