@@ -196,6 +196,13 @@ public:
         client_task_ = std::move(task);
     }
 
+    // Add a method to start the coroutine
+    void start_coroutine() {
+        if (client_task_ && client_task_->handle) {
+            client_task_->handle.resume();
+        }
+    }
+
     bool is_closed() const { return closed_; }
     int fd() const { return fd_; }
     const std::string& username() const { return session_->username; }
@@ -236,34 +243,54 @@ struct EpollAwaitable {
  * Client handling coroutine - Now handles all event processing like the reference code
  */
 Task handle_client(Client* client) {
+    std::cout << "[Debug] Client " << client->fd() << ": Coroutine started" << std::endl;
     client->send("Welcome to the chat server!\r\n");
 
     while (!client->is_closed()) {
+        std::cout << "[Debug] Client " << client->fd() << ": Awaiting events..." << std::endl;
         // Wait for epoll events
         uint32_t events = co_await EpollAwaitable(client);
+        std::cout << "[Debug] Client " << client->fd() << ": Got events: " 
+                  << (events & EPOLLIN ? "EPOLLIN " : "")
+                  << (events & EPOLLOUT ? "EPOLLOUT " : "") 
+                  << (events & EPOLLHUP ? "EPOLLHUP " : "")
+                  << (events & EPOLLERR ? "EPOLLERR " : "") << std::endl;
 
         // Handle the events directly in the coroutine
         if (events & (EPOLLHUP | EPOLLERR)) {
-            std::cerr << "Client FD " << client->fd() << " disconnected: HUP/ERR\n";
+            std::cerr << "[Debug] Client " << client->fd() << ": Disconnected: HUP/ERR" << std::endl;
+            client->close();
             co_return;
         }
 
         // Handle write if needed
         if (events & EPOLLOUT) {
+            std::cout << "[Debug] Client " << client->fd() << ": Handling write" << std::endl;
             if (!client->write()) {
+                std::cerr << "[Debug] Client " << client->fd() << ": Write failed, closing" << std::endl;
+                client->close();
                 co_return;
             }
         }
 
         // Handle read if needed
         if (events & EPOLLIN) {
+            std::cout << "[Debug] Client " << client->fd() << ": Handling read" << std::endl;
             if (!client->read()) {
+                std::cerr << "[Debug] Client " << client->fd() << ": Read failed, closing" << std::endl;
+                client->close();
                 co_return;
             }
         }
+
+        // Re-register for epoll events if still open
+        if (!client->is_closed()) {
+            std::cout << "[Debug] Client " << client->fd() << ": Re-registering with epoll" << std::endl;
+            client->register_epoll(true);
+        }
     }
 
-    std::cout << "Client coroutine completed for fd: " << client->fd() << std::endl;
+    std::cout << "[Debug] Client " << client->fd() << ": Coroutine completed" << std::endl;
     co_return;
 }
 
@@ -386,13 +413,14 @@ private:
             auto task_ptr = std::make_unique<Task>(handle_client(client.get()));
             client->set_task(std::move(task_ptr));
 
-            // Initial registration with epoll
-            client->register_epoll(false);
-
             // Add the client to our map
-            clients_[client_fd] = std::move(client);
+            clients_[client_fd] = client;
             std::cout << "New client connected: " << client_fd << std::endl;
 
+            // Start the coroutine - it's suspended initially
+            client->start_coroutine();
+
+            // Initial registration with epoll (done in the coroutine now)
         }
     }
 
