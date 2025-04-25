@@ -75,8 +75,12 @@ struct Task {
     Task& operator=(const Task&) = delete;
 };
 
+// Forward declarations for our coroutine handlers
+struct Task handle_client_read(class Client* client);
+struct Task handle_client_write(class Client* client);
+
 /**
- * Client - Represents a connected client (simplified)
+ * Client - Represents a connected client with separate read/write coroutines
  */
 class Client {
 public:
@@ -95,39 +99,71 @@ public:
             ::close(fd_);
             closed_ = true;
 
-            // Clean up coroutine
+            // Clean up coroutines
             if (read_handle_) {
-                //read_handle_.destroy();       // note: do not destroy here, coroutine is managed by the task
                 read_handle_ = nullptr;
             }
+            if (write_handle_) {
+                write_handle_ = nullptr;
+            }
 
-            client_task_.reset();       // the coroutine will also be destroyed when the task is destroyed
+            read_task_.reset();
+            write_task_.reset();
             session_.reset();
         }
     }
 
     void send(const std::string& msg) {
         write_queue_.push(msg);
-        register_epoll(true);
+
+        // Start write coroutine if needed and not already running
+        maybe_start_write_coroutine();
     }
 
-    void register_epoll(bool include_write = false) {
-        epoll_event ev;
-        ev.events = EPOLLIN | EPOLLHUP | EPOLLERR;
-        if (include_write && !write_queue_.empty()) ev.events |= EPOLLOUT;
-        ev.data.ptr = this;
+    bool perform_read() {
+        char buffer[1024];
+        ssize_t bytes = ::read(fd_, buffer, sizeof(buffer) - 1);
 
-        if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd_, &ev) == -1) {
-            if (errno == EINVAL || errno == ENOENT) {
-                // Not yet added, add instead
-                epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd_, &ev);
+        if (bytes <= 0) {
+            if (bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return true;  // No data available, not an error
+            }
+
+            std::cerr << "Client FD " << fd_ << " read failed: "
+                      << (bytes == 0 ? "EOF" : std::to_string(errno)) << '\n';
+            return false;
+        }
+
+        buffer[bytes] = '\0';
+        read_buffer_ += buffer;
+
+        return true;
+    }
+
+    // Process a complete line if available
+    bool process_line() {
+        size_t pos = read_buffer_.find('\n');
+        if (pos == std::string::npos) {
+            return false; // No complete line available
+        }
+
+        std::string line = read_buffer_.substr(0, pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+
+        if (!line.empty()) {
+            if (line[0] == '/' && line.size() > 6 && line.substr(0, 5) == "/nick") {
+                session_->username = line.substr(6);
+                send("Nickname changed to: " + session_->username + "\r\n");
             } else {
-                std::cerr << "epoll_ctl failed: " << strerror(errno) << ", fd_: "<< fd_<< std::endl;
+                broadcast_(fd_, line);
             }
         }
+
+        read_buffer_ = read_buffer_.substr(pos + 1);
+        return true;
     }
 
-    bool write() {
+    bool perform_write() {
         if (write_queue_.empty()) return true;
 
         const std::string& data = write_queue_.front();
@@ -146,67 +182,57 @@ public:
             }
         }
 
-        register_epoll(!write_queue_.empty());
         return true;
     }
 
-    bool read() {
-        char buffer[1024];
-        ssize_t bytes = ::read(fd_, buffer, sizeof(buffer) - 1);
-
-        if (bytes <= 0) {
-            if (bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                return true;  // No data available, not an error
-            }
-
-            std::cerr << "Client FD " << fd_ << " read failed: "
-                      << (bytes == 0 ? "EOF" : std::to_string(errno)) << '\n';
-            return false;
-        }
-
-        buffer[bytes] = '\0';
-        read_buffer_ += buffer;
-
-        // Process complete lines
-        size_t pos;
-        while ((pos = read_buffer_.find('\n')) != std::string::npos) {
-            std::string line = read_buffer_.substr(0, pos);
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-
-            if (!line.empty()) {
-                if (line[0] == '/' && line.size() > 6 && line.substr(0, 5) == "/nick") {
-                    session_->username = line.substr(6);
-                    send("Nickname changed to: " + session_->username + "\r\n");
-                } else {
-                    broadcast_(fd_, line);
-                }
-            }
-
-            read_buffer_ = read_buffer_.substr(pos + 1);
-        }
-
-        return true;
-    }
-
-    void set_coroutine_handle(std::coroutine_handle<> handle) {
+    // Set the read coroutine handle
+    void set_read_handle(std::coroutine_handle<> handle) {
         read_handle_ = handle;
     }
 
-    void set_task(std::unique_ptr<Task> task) {
-        client_task_ = std::move(task);
+    // Set the write coroutine handle
+    void set_write_handle(std::coroutine_handle<> handle) {
+        write_handle_ = handle;
     }
 
-    // Add a method to start the coroutine
-    void start_coroutine() {
-        if (client_task_ && client_task_->handle) {
-            client_task_->handle.resume();
+    void set_read_task(std::unique_ptr<Task> task) {
+        read_task_ = std::move(task);
+    }
+
+    void set_write_task(std::unique_ptr<Task> task) {
+        write_task_ = std::move(task);
+    }
+
+    void start_read_coroutine() {
+        if (read_task_ && read_task_->handle) {
+            read_task_->handle.resume();
+        }
+    }
+
+    void start_write_coroutine() {
+        if (write_task_ && write_task_->handle) {
+            write_task_->handle.resume();
+        }
+    }
+
+    void maybe_start_write_coroutine() {
+        // Start the write coroutine if there's data and it's not running
+        if (!write_queue_.empty() && (!write_task_ || !write_handle_ || write_handle_.done())) {
+            // Create new write coroutine for this client
+            std::cout << "[Debug] Creating new write coroutine for client " << fd_ << std::endl;
+            write_task_ = std::make_unique<Task>(handle_client_write(this));
+            start_write_coroutine();
         }
     }
 
     bool is_closed() const { return closed_; }
     int fd() const { return fd_; }
+    int epoll_fd() const { return epoll_fd_; }
     const std::string& username() const { return session_->username; }
     std::coroutine_handle<> read_handle() const { return read_handle_; }
+    std::coroutine_handle<> write_handle() const { return write_handle_; }
+    bool has_write_data() const { return !write_queue_.empty(); }
+
     uint32_t event = 0;  // Store current epoll event
 
 private:
@@ -217,22 +243,50 @@ private:
     std::queue<std::string> write_queue_;
     std::function<void(int, const std::string&)> broadcast_;
     std::unique_ptr<Session> session_;
+
+    // Handles and tasks for read and write coroutines
     std::coroutine_handle<> read_handle_ = nullptr;
-    std::unique_ptr<Task> client_task_;
+    std::coroutine_handle<> write_handle_ = nullptr;
+    std::unique_ptr<Task> read_task_;
+    std::unique_ptr<Task> write_task_;
 };
 
 /**
- * Epoll awaitable - for coroutine suspension
+ * Epoll awaitable - for coroutine suspension with specific event types
  */
 struct EpollAwaitable {
     Client* client;
+    uint32_t interest_events;
+    bool is_write_awaitable;
 
-    EpollAwaitable(Client* c) : client(c) {}
+    // Constructor with specific interest events (default to read events)
+    EpollAwaitable(Client* c, uint32_t events = EPOLLIN, bool is_write = false) 
+        : client(c), interest_events(events), is_write_awaitable(is_write) {}
+
     bool await_ready() noexcept { return false; }
+
     void await_suspend(std::coroutine_handle<> h) noexcept {
-        client->set_coroutine_handle(h);
-        client->register_epoll(true);
+        // Store the handle in the appropriate slot based on read vs write
+        if (is_write_awaitable) {
+            client->set_write_handle(h);
+        } else {
+            client->set_read_handle(h);
+        }
+
+        // Register for the specific events we're interested in
+        epoll_event ev;
+        ev.events = interest_events | EPOLLHUP | EPOLLERR;
+        ev.data.ptr = client;
+
+        int epoll_fd = client->epoll_fd();
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd(), &ev) == -1) {
+            if (errno == EINVAL || errno == ENOENT) {
+                // Not yet added, add instead
+                epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client->fd(), &ev);
+            }
+        }
     }
+
     uint32_t await_resume() noexcept { 
         // Return the epoll event to the coroutine
         return client->event; 
@@ -240,54 +294,69 @@ struct EpollAwaitable {
 };
 
 /**
- * Client handling coroutine - Now handles all event processing like the reference code
+ * Read coroutine - Handles reading in a blocking-style
  */
-Task handle_client(Client* client) {
-    std::cout << "[Debug] Client " << client->fd() << ": Coroutine started" << std::endl;
+Task handle_client_read(Client* client) {
+    std::cout << "[Debug] Client " << client->fd() << ": Read coroutine started" << std::endl;
     client->send("Welcome to the chat server!\r\n");
 
     while (!client->is_closed()) {
-        std::cout << "[Debug] Client " << client->fd() << ": Awaiting events..." << std::endl;
-        // Wait for epoll events
-        uint32_t events = co_await EpollAwaitable(client);
-        std::cout << "[Debug] Client " << client->fd() << ": Got events: " 
-                  << (events & EPOLLIN ? "EPOLLIN " : "")
-                  << (events & EPOLLOUT ? "EPOLLOUT " : "") 
-                  << (events & EPOLLHUP ? "EPOLLHUP " : "")
-                  << (events & EPOLLERR ? "EPOLLERR " : "") << std::endl;
+        // Wait for read events in a blocking style
+        uint32_t events = co_await EpollAwaitable(client, EPOLLIN, false);
 
-        // Handle the events directly in the coroutine
+        // Check for disconnect events
         if (events & (EPOLLHUP | EPOLLERR)) {
             std::cerr << "[Debug] Client " << client->fd() << ": Disconnected: HUP/ERR" << std::endl;
             co_return;
         }
 
-        // Handle write if needed
+        // If we have EPOLLIN event, read data until we get a line
+        if (events & EPOLLIN) {
+            // Read available data
+            if (!client->perform_read()) {
+                std::cerr << "[Debug] Client " << client->fd() << ": Read failed, closing" << std::endl;
+                co_return;
+            }
+
+            // Process any complete lines
+            while (client->process_line()) {
+                // Each complete line is now processed and responses are queued
+            }
+        }
+    }
+
+    std::cout << "[Debug] Client " << client->fd() << ": Read coroutine completed" << std::endl;
+    co_return;
+}
+
+/**
+ * Write coroutine - Handles writing in a blocking-style
+ * This coroutine is created on-demand when there's data to write
+ */
+Task handle_client_write(Client* client) {
+    std::cout << "[Debug] Client " << client->fd() << ": Write coroutine started" << std::endl;
+
+    // Continue writing as long as we have data and client is connected
+    while (!client->is_closed() && client->has_write_data()) {
+        // Wait for write events in a blocking style
+        uint32_t events = co_await EpollAwaitable(client, EPOLLOUT, true);
+
+        // Check for disconnect events
+        if (events & (EPOLLHUP | EPOLLERR)) {
+            std::cerr << "[Debug] Client " << client->fd() << ": Disconnected: HUP/ERR" << std::endl;
+            co_return;
+        }
+
+        // If we have EPOLLOUT event, write data
         if (events & EPOLLOUT) {
-            std::cout << "[Debug] Client " << client->fd() << ": Handling write" << std::endl;
-            if (!client->write()) {
+            if (!client->perform_write()) {
                 std::cerr << "[Debug] Client " << client->fd() << ": Write failed, closing" << std::endl;
                 co_return;
             }
         }
-
-        // Handle read if needed
-        if (events & EPOLLIN) {
-            std::cout << "[Debug] Client " << client->fd() << ": Handling read" << std::endl;
-            if (!client->read()) {
-                std::cerr << "[Debug] Client " << client->fd() << ": Read failed, closing" << std::endl;
-                co_return;
-            }
-        }
-
-        // Re-register for epoll events if still open
-        if (!client->is_closed()) {
-            std::cout << "[Debug] Client " << client->fd() << ": Re-registering with epoll" << std::endl;
-            client->register_epoll(true);
-        }
     }
 
-    std::cout << "[Debug] Client " << client->fd() << ": Coroutine completed" << std::endl;
+    std::cout << "[Debug] Client " << client->fd() << ": Write coroutine completed" << std::endl;
     co_return;
 }
 
@@ -365,15 +434,21 @@ public:
                     // Store the event in the client for the coroutine to access
                     client->event = events[i].events;
 
-                    // Just resume the coroutine - it will handle the events
+                    // Resume read coroutine if active
                     if (client->read_handle() && !client->read_handle().done()) {
-                        std::cout<< "[Debug] Resuming coroutine for client " << client->fd() << std::endl;
+                        std::cout << "[Debug] Resuming read coroutine for client " << client->fd() << std::endl;
                         client->read_handle().resume();
                     }
 
-                    // Clean up or completed clients
-                    if ((client->read_handle() && client->read_handle().done())) {
-                        std::cout<< "[Debug] erasing client " << client->fd() << std::endl;
+                    // Resume write coroutine if active
+                    if (client->write_handle() && !client->write_handle().done()) {
+                        std::cout << "[Debug] Resuming write coroutine for client " << client->fd() << std::endl;
+                        client->write_handle().resume();
+                    }
+
+                    // Clean up if read coroutine is completed (main indicator client is done)
+                    if (client->read_handle() && client->read_handle().done()) {
+                        std::cout << "[Debug] Erasing client " << client->fd() << std::endl;
                         clients_.erase(client->fd());
                     }
                 }
@@ -409,15 +484,15 @@ private:
                 });
 
             // Create and store task in the client
-            auto task_ptr = std::make_unique<Task>(handle_client(client.get()));
-            client->set_task(std::move(task_ptr));
+            auto task_ptr = std::make_unique<Task>(handle_client_read(client.get()));
+            client->set_read_task(std::move(task_ptr));
 
             // Add the client to our map
             clients_[client_fd] = client;
             std::cout << "New client connected: " << client_fd << std::endl;
 
             // Start the coroutine - it's suspended initially
-            client->start_coroutine();
+            client->start_read_coroutine();
 
             // Initial registration with epoll (done in the coroutine now)
         }
