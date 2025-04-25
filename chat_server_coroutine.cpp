@@ -22,14 +22,7 @@ void set_nonblocking(int fd) {
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-/**
- * Simple session class - tracks user information
- */
-struct Session {
-    std::string username;
-    Session(std::string name) : username(std::move(name)) {}
-    ~Session() { std::cout << "Session for " << username << " destroyed\n"; }
-};
+// Removed Session class
 
 /**
  * Simplified Task - Similar to the reference code
@@ -87,7 +80,7 @@ public:
     Client(int fd, int epoll_fd, std::function<void(int, const std::string&)> broadcast)
         : fd_(fd), epoll_fd_(epoll_fd), closed_(false), 
           broadcast_(std::move(broadcast)),
-          session_(std::make_unique<Session>("user" + std::to_string(fd))) {
+          username_("user" + std::to_string(fd)) {
         set_nonblocking(fd);
     }
 
@@ -109,7 +102,6 @@ public:
 
             read_task_.reset();
             write_task_.reset();
-            session_.reset();
         }
     }
 
@@ -152,8 +144,8 @@ public:
 
         if (!line.empty()) {
             if (line[0] == '/' && line.size() > 6 && line.substr(0, 5) == "/nick") {
-                session_->username = line.substr(6);
-                send("Nickname changed to: " + session_->username + "\r\n");
+                username_ = line.substr(6);
+                send("Nickname changed to: " + username_ + "\r\n");
             } else {
                 broadcast_(fd_, line);
             }
@@ -228,7 +220,7 @@ public:
     bool is_closed() const { return closed_; }
     int fd() const { return fd_; }
     int epoll_fd() const { return epoll_fd_; }
-    const std::string& username() const { return session_->username; }
+    const std::string& username() const { return username_; }
     std::coroutine_handle<> read_handle() const { return read_handle_; }
     std::coroutine_handle<> write_handle() const { return write_handle_; }
     bool has_write_data() const { return !write_queue_.empty(); }
@@ -242,7 +234,7 @@ private:
     std::string read_buffer_;
     std::queue<std::string> write_queue_;
     std::function<void(int, const std::string&)> broadcast_;
-    std::unique_ptr<Session> session_;
+    std::string username_;
 
     // Handles and tasks for read and write coroutines
     std::coroutine_handle<> read_handle_ = nullptr;
