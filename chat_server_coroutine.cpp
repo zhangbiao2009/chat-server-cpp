@@ -80,6 +80,10 @@ public:
           broadcast_(std::move(broadcast)),
           username_("user" + std::to_string(fd)) {
         set_nonblocking(fd);
+
+        // Register for EPOLLIN once during initialization
+        register_for_reading();
+        std::cout << "[Client] FD " << fd_ << " registered for reading (EPOLLIN)" << std::endl;
     }
 
     ~Client() { close(); }
@@ -110,7 +114,31 @@ public:
         maybe_start_write_coroutine();
     }
 
-    // Removed perform_write method
+    // Register for reading (EPOLLIN) events
+    void register_for_reading() {
+        epoll_event ev;
+        ev.events = EPOLLIN | EPOLLHUP | EPOLLERR;
+        ev.data.ptr = this;
+        epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd_, &ev);
+    }
+
+    // Add EPOLLOUT to the existing registration
+    void enable_writing() {
+        std::cout << "[Client] Enabling writing for FD " << fd_ << std::endl;
+        epoll_event ev;
+        ev.events = EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLERR; // Add EPOLLOUT
+        ev.data.ptr = this;
+        epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd_, &ev);
+    }
+
+    // Remove EPOLLOUT from the existing registration
+    void disable_writing() {
+        std::cout << "[Client] Disabling writing for FD " << fd_ << std::endl;
+        epoll_event ev;
+        ev.events = EPOLLIN | EPOLLHUP | EPOLLERR; // Back to just EPOLLIN
+        ev.data.ptr = this;
+        epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd_, &ev);
+    }
 
     // Set the read coroutine handle
     void set_read_handle(std::coroutine_handle<> handle) {
@@ -195,39 +223,40 @@ private:
  */
 struct EpollAwaitable {
     Client* client;
-    uint32_t interest_events;
     bool is_write_awaitable;
 
-    // Constructor with specific interest events (default to read events)
-    EpollAwaitable(Client* c, uint32_t events = EPOLLIN, bool is_write = false) 
-        : client(c), interest_events(events), is_write_awaitable(is_write) {}
+    // Simplified constructor - just needs client and whether it's for write operations
+    EpollAwaitable(Client* c, bool is_write = false) 
+        : client(c), is_write_awaitable(is_write) {
+        std::cout << "[EpollAwaitable] Created for client " << client->fd() 
+                  << (is_write ? " (write)" : " (read)") << std::endl;
+    }
 
     bool await_ready() noexcept { return false; }
 
     void await_suspend(std::coroutine_handle<> h) noexcept {
+        std::cout << "[EpollAwaitable] Suspending " << (is_write_awaitable ? "write" : "read") 
+                  << " coroutine for client " << client->fd() << std::endl;
+
         // Store the handle in the appropriate slot based on read vs write
         if (is_write_awaitable) {
             client->set_write_handle(h);
+            client->enable_writing(); // Enable writing when write coroutine suspends
         } else {
             client->set_read_handle(h);
-        }
-
-        // Register for the specific events we're interested in
-        epoll_event ev;
-        ev.events = interest_events | EPOLLHUP | EPOLLERR;
-        ev.data.ptr = client;
-
-        int epoll_fd = client->epoll_fd();
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd(), &ev) == -1) {
-            if (errno == EINVAL || errno == ENOENT) {
-                // Not yet added, add instead
-                epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client->fd(), &ev);
-            }
+            // No need to register for reading, it's already done once in the constructor
         }
     }
 
     uint32_t await_resume() noexcept { 
         // Return the epoll event to the coroutine
+        std::cout << "[EpollAwaitable] Resuming " << (is_write_awaitable ? "write" : "read")
+                  << " coroutine for client " << client->fd() 
+                  << " with events: " 
+                  << (client->event & EPOLLIN ? "EPOLLIN " : "") 
+                  << (client->event & EPOLLOUT ? "EPOLLOUT " : "")
+                  << (client->event & EPOLLHUP ? "EPOLLHUP " : "") 
+                  << (client->event & EPOLLERR ? "EPOLLERR " : "") << std::endl;
         return client->event; 
     }
 };
@@ -237,6 +266,9 @@ struct EpollAwaitable {
  */
 Task handle_client_read(Client* client) {
     std::cout << "[Debug] Client " << client->fd() << ": Read coroutine started" << std::endl;
+
+    // Send welcome message and log it
+    std::cout << "[Debug] Sending welcome message to client " << client->fd() << std::endl;
     client->send("Welcome to the chat server!\r\n");
 
     // Local buffer in the coroutine - persists across co_await calls
@@ -244,7 +276,7 @@ Task handle_client_read(Client* client) {
 
     while (!client->is_closed()) {
         // Wait for read events in a blocking style
-        uint32_t events = co_await EpollAwaitable(client, EPOLLIN, false);
+        uint32_t events = co_await EpollAwaitable(client);  // using default false for is_write
 
         // Check for disconnect events
         if (events & (EPOLLHUP | EPOLLERR)) {
@@ -259,7 +291,7 @@ Task handle_client_read(Client* client) {
             ssize_t bytes = ::read(client->fd(), buffer, sizeof(buffer) - 1);
 
             if (bytes <= 0) {
-                if (bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                if (bytes < 0 && (errno == EAGAIN || EWOULDBLOCK)) {
                     continue;  // No data available, not an error
                 }
 
@@ -307,11 +339,16 @@ Task handle_client_read(Client* client) {
  */
 Task handle_client_write(Client* client) {
     std::cout << "[Debug] Client " << client->fd() << ": Write coroutine started" << std::endl;
+    std::cout << "[Debug] Client " << client->fd() << ": Has write data: " << (client->has_write_data() ? "yes" : "no") << std::endl;
 
     // Continue writing as long as we have data and client is connected
     while (!client->is_closed() && client->has_write_data()) {
+        // Log the message we're trying to send
+        std::cout << "[Debug] Client " << client->fd() << ": Waiting to write: \"" 
+                  << client->front_message().substr(0, 20) << "...\"" << std::endl;
+
         // Wait for write events in a blocking style
-        uint32_t events = co_await EpollAwaitable(client, EPOLLOUT, true);
+        uint32_t events = co_await EpollAwaitable(client, true);  // true for is_write
 
         // Check for disconnect events
         if (events & (EPOLLHUP | EPOLLERR)) {
@@ -337,6 +374,11 @@ Task handle_client_write(Client* client) {
                 }
             }
         }
+    }
+
+    // When we're done writing, disable the EPOLLOUT flag
+    if (!client->is_closed()) {
+        client->disable_writing();
     }
 
     std::cout << "[Debug] Client " << client->fd() << ": Write coroutine completed" << std::endl;
