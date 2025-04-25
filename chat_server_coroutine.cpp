@@ -22,8 +22,6 @@ void set_nonblocking(int fd) {
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-// Removed Session class
-
 /**
  * Simplified Task - Similar to the reference code
  */
@@ -112,70 +110,7 @@ public:
         maybe_start_write_coroutine();
     }
 
-    bool perform_read() {
-        char buffer[1024];
-        ssize_t bytes = ::read(fd_, buffer, sizeof(buffer) - 1);
-
-        if (bytes <= 0) {
-            if (bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                return true;  // No data available, not an error
-            }
-
-            std::cerr << "Client FD " << fd_ << " read failed: "
-                      << (bytes == 0 ? "EOF" : std::to_string(errno)) << '\n';
-            return false;
-        }
-
-        buffer[bytes] = '\0';
-        read_buffer_ += buffer;
-
-        return true;
-    }
-
-    // Process a complete line if available
-    bool process_line() {
-        size_t pos = read_buffer_.find('\n');
-        if (pos == std::string::npos) {
-            return false; // No complete line available
-        }
-
-        std::string line = read_buffer_.substr(0, pos);
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-
-        if (!line.empty()) {
-            if (line[0] == '/' && line.size() > 6 && line.substr(0, 5) == "/nick") {
-                username_ = line.substr(6);
-                send("Nickname changed to: " + username_ + "\r\n");
-            } else {
-                broadcast_(fd_, line);
-            }
-        }
-
-        read_buffer_ = read_buffer_.substr(pos + 1);
-        return true;
-    }
-
-    bool perform_write() {
-        if (write_queue_.empty()) return true;
-
-        const std::string& data = write_queue_.front();
-        ssize_t bytes = ::send(fd_, data.data(), data.size(), 0);
-
-        if (bytes <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            std::cerr << "Write failed for FD " << fd_ << ": errno " << errno << '\n';
-            return false;
-        }
-
-        if (bytes > 0) {
-            if (static_cast<size_t>(bytes) == data.size()) {
-                write_queue_.pop();
-            } else {
-                write_queue_.front() = data.substr(bytes);
-            }
-        }
-
-        return true;
-    }
+    // Removed perform_write method
 
     // Set the read coroutine handle
     void set_read_handle(std::coroutine_handle<> handle) {
@@ -210,7 +145,6 @@ public:
     void maybe_start_write_coroutine() {
         // Start the write coroutine if there's data and it's not running
         if (!write_queue_.empty() && (!write_task_ || !write_handle_ || write_handle_.done())) {
-            // Create new write coroutine for this client
             std::cout << "[Debug] Creating new write coroutine for client " << fd_ << std::endl;
             write_task_ = std::make_unique<Task>(handle_client_write(this));
             start_write_coroutine();
@@ -225,13 +159,26 @@ public:
     std::coroutine_handle<> write_handle() const { return write_handle_; }
     bool has_write_data() const { return !write_queue_.empty(); }
 
+    // Add these accessor methods for the write queue
+    const std::string& front_message() const { return write_queue_.front(); }
+    void pop_message() { write_queue_.pop(); }
+    void update_front_message(const std::string& new_data) { write_queue_.front() = new_data; }
+
     uint32_t event = 0;  // Store current epoll event
+
+    void broadcast_message(const std::string& message) {
+        broadcast_(fd_, message);
+    }
+
+    void change_username(const std::string& new_name) {
+        username_ = new_name;
+        send("Nickname changed to: " + new_name + "\r\n");
+    }
 
 private:
     int fd_;
     int epoll_fd_;
     bool closed_;
-    std::string read_buffer_;
     std::queue<std::string> write_queue_;
     std::function<void(int, const std::string&)> broadcast_;
     std::string username_;
@@ -292,6 +239,9 @@ Task handle_client_read(Client* client) {
     std::cout << "[Debug] Client " << client->fd() << ": Read coroutine started" << std::endl;
     client->send("Welcome to the chat server!\r\n");
 
+    // Local buffer in the coroutine - persists across co_await calls
+    std::string read_buffer;
+
     while (!client->is_closed()) {
         // Wait for read events in a blocking style
         uint32_t events = co_await EpollAwaitable(client, EPOLLIN, false);
@@ -305,15 +255,45 @@ Task handle_client_read(Client* client) {
         // If we have EPOLLIN event, read data until we get a line
         if (events & EPOLLIN) {
             // Read available data
-            if (!client->perform_read()) {
+            char buffer[1024];
+            ssize_t bytes = ::read(client->fd(), buffer, sizeof(buffer) - 1);
+
+            if (bytes <= 0) {
+                if (bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    continue;  // No data available, not an error
+                }
+
+                std::cerr << "Client FD " << client->fd() << " read failed: "
+                          << (bytes == 0 ? "EOF" : std::to_string(errno)) << '\n';
                 std::cerr << "[Debug] Client " << client->fd() << ": Read failed, closing" << std::endl;
                 co_return;
             }
 
+            buffer[bytes] = '\0';
+            read_buffer += buffer;
+
             // Process any complete lines
-            while (client->process_line()) {
-                // Each complete line is now processed and responses are queued
-            }
+            bool processed;
+            do {
+                size_t pos = read_buffer.find('\n');
+                if (pos == std::string::npos) {
+                    processed = false; // No complete line available
+                } else {
+                    std::string line = read_buffer.substr(0, pos);
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+
+                    if (!line.empty()) {
+                        if (line[0] == '/' && line.size() > 6 && line.substr(0, 5) == "/nick") {
+                            client->change_username(line.substr(6));
+                        } else {
+                            client->broadcast_message(line);
+                        }
+                    }
+
+                    read_buffer = read_buffer.substr(pos + 1);
+                    processed = true;
+                }
+            } while (processed);
         }
     }
 
@@ -339,11 +319,22 @@ Task handle_client_write(Client* client) {
             co_return;
         }
 
-        // If we have EPOLLOUT event, write data
-        if (events & EPOLLOUT) {
-            if (!client->perform_write()) {
-                std::cerr << "[Debug] Client " << client->fd() << ": Write failed, closing" << std::endl;
+        // If we have EPOLLOUT event, write data directly
+        if (events & EPOLLOUT && client->has_write_data()) {
+            const std::string& data = client->front_message();
+            ssize_t bytes = ::send(client->fd(), data.data(), data.size(), 0);
+
+            if (bytes <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                std::cerr << "Write failed for FD " << client->fd() << ": errno " << errno << '\n';
                 co_return;
+            }
+
+            if (bytes > 0) {
+                if (static_cast<size_t>(bytes) == data.size()) {
+                    client->pop_message();
+                } else {
+                    client->update_front_message(data.substr(bytes));
+                }
             }
         }
     }
