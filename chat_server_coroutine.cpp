@@ -22,6 +22,25 @@ void set_nonblocking(int fd) {
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+// Set socket send buffer size
+void set_socket_send_buffer_size(int fd, int size) {
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size)) < 0) {
+        std::cerr << "Failed to set SO_SNDBUF to " << size << " bytes: " 
+                  << strerror(errno) << std::endl;
+        return;
+    }
+    
+    // Get the actual buffer size allocated by the kernel
+    int actual_size;
+    socklen_t size_len = sizeof(actual_size);
+    if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual_size, &size_len) < 0) {
+        std::cerr << "Failed to get SO_SNDBUF value: " << strerror(errno) << std::endl;
+    } else {
+        std::cout << "Set socket send buffer size to " << size << " bytes for FD " 
+                  << fd << ", actual kernel buffer size: " << actual_size << " bytes" << std::endl;
+    }
+}
+
 /**
  * Simplified Task - Similar to the reference code
  */
@@ -80,6 +99,9 @@ public:
           broadcast_(std::move(broadcast)),
           username_("user" + std::to_string(fd)) {
         set_nonblocking(fd);
+        
+        // Set send buffer size to 4K for client socket
+        set_socket_send_buffer_size(fd, 4096);
 
         // Register for EPOLLIN once during initialization
         register_for_reading();
@@ -110,8 +132,53 @@ public:
     void send(const std::string& msg) {
         write_queue_.push(msg);
 
-        // Start write coroutine if needed and not already running
+        /*
+        // Try to write immediately - if it succeeds completely, we avoid creating a coroutine
+        if (try_write()) {
+            // All data written, no need to start write coroutine
+            return;
+        }
+        */
+
+        // If we have data remaining, start write coroutine
         maybe_start_write_coroutine();
+    }
+
+    // Try to write all queued messages without waiting for EPOLLOUT
+    // Returns true if all data was written, false if we need to wait for EPOLLOUT
+    bool try_write() {
+        if (write_queue_.empty()) return true;
+
+        while (!write_queue_.empty()) {
+            const std::string& data = write_queue_.front();
+            ssize_t bytes = ::send(fd_, data.data(), data.size(), 0);
+
+            std::cout << "[Client] Immediate write attempt for FD " << fd_ 
+                      << ": " << (bytes > 0 ? bytes : 0) << " of " << data.size() << " bytes" << std::endl;
+
+            if (bytes <= 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // Socket buffer is full, need to wait for EPOLLOUT
+                    std::cout << "[Client] Socket buffer full, will wait for EPOLLOUT" << std::endl;
+                    return false;
+                } else {
+                    // Real error
+                    std::cerr << "[Client] Write error for FD " << fd_ << ": " << strerror(errno) << std::endl;
+                    return false;
+                }
+            }
+
+            if (static_cast<size_t>(bytes) == data.size()) {
+                // Full write successful
+                write_queue_.pop();
+            } else {
+                // Partial write, update the buffer and return false to wait for EPOLLOUT
+                write_queue_.front() = data.substr(bytes);
+                return false;
+            }
+        }
+
+        return true; // All data was written
     }
 
     // Register for reading (EPOLLIN) events
@@ -290,6 +357,7 @@ Task handle_client_read(Client* client) {
             char buffer[1024];
             ssize_t bytes = ::read(client->fd(), buffer, sizeof(buffer) - 1);
 
+            std::cerr << "[Debug] Client " << client->fd() << " Number of bytes Read: " << bytes << std::endl;
             if (bytes <= 0) {
                 if (bytes < 0 && (errno == EAGAIN || EWOULDBLOCK)) {
                     continue;  // No data available, not an error
@@ -341,11 +409,16 @@ Task handle_client_write(Client* client) {
     std::cout << "[Debug] Client " << client->fd() << ": Write coroutine started" << std::endl;
     std::cout << "[Debug] Client " << client->fd() << ": Has write data: " << (client->has_write_data() ? "yes" : "no") << std::endl;
 
+    // First, try to write immediately without waiting
+    if (client->try_write()) {
+        std::cout << "[Debug] Client " << client->fd() << ": Immediate write successful, write coroutine completing" << std::endl;
+        co_return; // No need to wait for EPOLLOUT if everything was written
+    }
+
     // Continue writing as long as we have data and client is connected
     while (!client->is_closed() && client->has_write_data()) {
         // Log the message we're trying to send
-        std::cout << "[Debug] Client " << client->fd() << ": Waiting to write: \"" 
-                  << client->front_message().substr(0, 20) << "...\"" << std::endl;
+        std::cout << "[Debug] Client " << client->fd() << ": Waiting to write remaining data" << std::endl;
 
         // Wait for write events in a blocking style
         uint32_t events = co_await EpollAwaitable(client, true);  // true for is_write
@@ -356,22 +429,11 @@ Task handle_client_write(Client* client) {
             co_return;
         }
 
-        // If we have EPOLLOUT event, write data directly
-        if (events & EPOLLOUT && client->has_write_data()) {
-            const std::string& data = client->front_message();
-            ssize_t bytes = ::send(client->fd(), data.data(), data.size(), 0);
-
-            if (bytes <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                std::cerr << "Write failed for FD " << client->fd() << ": errno " << errno << '\n';
-                co_return;
-            }
-
-            if (bytes > 0) {
-                if (static_cast<size_t>(bytes) == data.size()) {
-                    client->pop_message();
-                } else {
-                    client->update_front_message(data.substr(bytes));
-                }
+        // If we have EPOLLOUT event, try to write again
+        if (events & EPOLLOUT) {
+            // If try_write successfully writes everything, we can exit the loop
+            if (client->try_write()) {
+                break;
             }
         }
     }
@@ -410,7 +472,6 @@ public:
         int opt = 1;
         setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         set_nonblocking(server_fd_);
-
         // Bind
         struct sockaddr_in addr;
         addr.sin_family = AF_INET;
