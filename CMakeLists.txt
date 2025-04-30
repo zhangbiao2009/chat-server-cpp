@@ -10,8 +10,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -g")
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
 
-add_executable(chat-server-cpp chat_server_coroutine.cpp)
+# Find Boost
+find_package(Boost REQUIRED)
+include_directories(${Boost_INCLUDE_DIRS})
 
-# Link with pthread for threading support
+# Add executables
+add_executable(chat-server-cpp chat_server_asio_coroutine.cpp)
+
+# Link with pthread and boost
 find_package(Threads REQUIRED)
-target_link_libraries(chat-server-cpp PRIVATE Threads::Threads)
+target_link_libraries(chat-server-cpp PRIVATE Threads::Threads ${Boost_LIBRARIES})
