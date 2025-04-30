@@ -8,8 +8,6 @@
 #include <memory>
 #include <random>
 #include <coroutine>
-#include <functional>
-#include <thread>
 #include <boost/asio.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
 
@@ -22,20 +20,20 @@ using asio::use_awaitable;
 
 // Generate a random nickname (4 alphanumeric chars by default)
 std::string random_nickname(size_t length = 4) {
-    const std::string chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
-    static std::uniform_int_distribution<> dist(0, chars.size() - 1);
+    static const std::string chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    static std::mt19937 gen(std::random_device{}());
+    std::uniform_int_distribution<> dist(0, chars.size() - 1);
 
     std::string result(length, ' ');
-    for (size_t i = 0; i < length; i++) {
-        result[i] = chars[dist(gen)];
+    for (char& c : result) {
+        c = chars[dist(gen)];
     }
     return result;
 }
 
-// Forward declaration
+// Forward declarations
 class chat_room;
+class chat_participant;
 
 // Represents a single client connection
 class chat_participant : public std::enable_shared_from_this<chat_participant> {
@@ -43,7 +41,8 @@ public:
     chat_participant(tcp::socket socket, chat_room& room) 
         : socket_(std::move(socket)), 
           room_(room), 
-          username_(random_nickname()) {}
+          username_(random_nickname()),
+          id_(-1) {}
 
     // Start processing this connection
     void start() {
@@ -64,48 +63,18 @@ public:
     const std::string& username() const { return username_; }
     void username(const std::string& new_name) { username_ = new_name; }
 
+    int id() const { return id_; }
+    void id(int new_id) { id_ = new_id; }
+
 private:
-    // Read messages from client
+    // Declarations only - implementations moved outside the class
     awaitable<void> reader();
-
-    // Write messages to client
-    awaitable<void> writer() {
-        try {
-            while (!write_queue_.empty()) {
-                co_await asio::async_write(
-                    socket_,
-                    asio::buffer(write_queue_.front()),
-                    use_awaitable
-                );
-                write_queue_.pop();
-            }
-        } 
-        catch (std::exception&) {
-            stop();
-        }
-        co_return;
-    }
-
-    // Process a line received from client
-    void process_line(const std::string& line);
-
-    // Handle a command (starting with /)
-    void handle_command(const std::string& command) {
-        if (command.substr(0, 6) == "/nick " && command.length() > 6) {
-            std::string new_name = command.substr(6);
-            std::string old_name = username_;
-            username_ = new_name;
-            std::cout << "Client renamed from " << old_name << " to " << new_name << std::endl;
-            deliver("Nickname changed to: " + new_name + "\r\n");
-        }
-    }
-
-    // Stop and remove this client
-    void stop();
+    awaitable<void> writer();
 
     tcp::socket socket_;
     chat_room& room_;
     std::string username_;
+    int id_;
     std::queue<std::string> write_queue_;
     std::string read_buffer_;
 };
@@ -113,27 +82,26 @@ private:
 // Manages all connected clients
 class chat_room {
 public:
+    chat_room() : next_id_(1) {}
+
     // Add a new participant to the room
     void join(std::shared_ptr<chat_participant> participant) {
-        participants_.push_back(participant);
-        std::cout << "Client connected: " << participant->username() << std::endl;
+        int id = next_id_++;
+        participant->id(id);
+        participants_[id] = participant;
+        std::cout << "Client connected: ID " << id << std::endl;
     }
 
     // Remove a participant from the room
     void leave(std::shared_ptr<chat_participant> participant) {
-        auto it = std::find(participants_.begin(), participants_.end(), participant);
-        if (it != participants_.end()) {
-            std::cout << "Client disconnected: " << participant->username() << std::endl;
-            participants_.erase(it);
-        }
+        participants_.erase(participant->id());
     }
 
     // Broadcast a message to all participants except the sender
     void broadcast(std::shared_ptr<chat_participant> sender, const std::string& message) {
         std::string formatted = sender->username() + ": " + message + "\r\n";
-        std::cout << "Broadcasting: " << formatted;
 
-        for (auto& participant : participants_) {
+        for (auto& [id, participant] : participants_) {
             if (participant != sender) {
                 participant->deliver(formatted);
             }
@@ -141,53 +109,9 @@ public:
     }
 
 private:
-    std::vector<std::shared_ptr<chat_participant>> participants_;
+    std::unordered_map<int, std::shared_ptr<chat_participant>> participants_;
+    int next_id_;
 };
-
-// Implementation of participant methods that need the complete chat_room definition
-void chat_participant::stop() {
-    room_.leave(shared_from_this());
-}
-
-awaitable<void> chat_participant::reader() {
-    try {
-        for (;;) {
-            // Read until newline
-            std::size_t n = co_await asio::async_read_until(
-                socket_,
-                asio::dynamic_buffer(read_buffer_),
-                '\n',
-                use_awaitable
-            );
-
-            // Extract and process the line
-            std::string line(read_buffer_.substr(0, n));
-            read_buffer_.erase(0, n);
-
-            // Remove CR/LF
-            if (!line.empty() && line[line.size() - 2] == '\r')
-                line.erase(line.size() - 2, 1);
-            if (!line.empty() && line.back() == '\n')
-                line.pop_back();
-
-            process_line(line);
-        }
-    } 
-    catch (std::exception&) {
-        stop();
-    }
-    co_return;
-}
-
-void chat_participant::process_line(const std::string& line) {
-    std::cout << "Received from " << username_ << ": " << line << std::endl;
-
-    if (!line.empty() && line[0] == '/') {
-        handle_command(line);
-    } else {
-        room_.broadcast(shared_from_this(), line);
-    }
-}
 
 // Chat server accepts new connections and creates participants
 class chat_server {
@@ -200,20 +124,80 @@ public:
 
 private:
     awaitable<void> listener() {
-        for (;;) {
-            // Wait for a new connection
-            tcp::socket socket = co_await acceptor_.async_accept(use_awaitable);
+        try {
+            for (;;) {
+                // Accept new connections
+                auto socket = co_await acceptor_.async_accept(use_awaitable);
 
-            // Create and start a new participant
-            auto participant = std::make_shared<chat_participant>(std::move(socket), room_);
-            room_.join(participant);
-            participant->start();
+                // Create and start new participant
+                auto participant = std::make_shared<chat_participant>(std::move(socket), room_);
+                room_.join(participant);
+                participant->start();
+            }
+        } catch (std::exception& e) {
+            std::cerr << "Listener exception: " << e.what() << std::endl;
         }
     }
 
     tcp::acceptor acceptor_;
     chat_room room_;
 };
+
+awaitable<void> chat_participant::reader() {
+    try {
+        for (;;) {
+            // Read until newline
+            std::size_t n = co_await asio::async_read_until(
+                socket_,
+                asio::dynamic_buffer(read_buffer_),
+                '\n',
+                use_awaitable
+            );
+
+            // Extract the line and process
+            std::string line(read_buffer_.substr(0, n));
+            read_buffer_.erase(0, n);
+
+            // Trim CR/LF
+            if (!line.empty()) {
+                if (line.back() == '\n') line.pop_back();
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+            }
+
+            // Handle the message
+            if (!line.empty()) {
+                if (line[0] == '/') {
+                    // Command handling
+                    if (line.substr(0, 6) == "/nick " && line.length() > 6) {
+                        username_ = line.substr(6);
+                        deliver("Nickname changed to: " + username_ + "\r\n");
+                    }
+                } else {
+                    room_.broadcast(shared_from_this(), line);
+                }
+            }
+        }
+    } 
+    catch (std::exception&) {
+        room_.leave(shared_from_this());
+    }
+}
+
+awaitable<void> chat_participant::writer() {
+    try {
+        while (!write_queue_.empty()) {
+            co_await asio::async_write(
+                socket_,
+                asio::buffer(write_queue_.front()),
+                use_awaitable
+            );
+            write_queue_.pop();
+        }
+    } 
+    catch (std::exception&) {
+        room_.leave(shared_from_this());
+    }
+}
 
 int main(int argc, char* argv[]) {
     try {
@@ -226,21 +210,9 @@ int main(int argc, char* argv[]) {
         // Create and start the server
         chat_server server(io_context, port);
 
-        // Run with multiple threads for better performance
-        const int thread_count = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
-        std::vector<std::thread> threads;
-
-        // Create additional threads (current thread will be used too)
-        for (int i = 1; i < thread_count; ++i) {
-            threads.emplace_back([&io_context]() { io_context.run(); });
-        }
-
-        // Run in the current thread too
+        // Run in a single thread as requested
+        std::cout << "Running server in single-threaded mode" << std::endl;
         io_context.run();
-
-        // Join threads (should never get here under normal operation)
-        for (auto& thread : threads)
-            thread.join();
     }
     catch (std::exception& e) {
         std::cerr << "Exception: " << e.what() << std::endl;
