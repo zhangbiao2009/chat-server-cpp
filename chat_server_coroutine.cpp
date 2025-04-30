@@ -16,27 +16,21 @@
 #include <cstring>
 #include <errno.h>
 
+// Debug logging macros - comment out to disable verbose logs
+#define DEBUG_LOGGING
 
-#define LOG_DEBUG(msg) std::cout << "[Debug] " << msg << std::endl
-#define LOG_INFO(msg) std::cout << "[Info] " << msg << std::endl
+#ifdef DEBUG_LOGGING
+    #define LOG_DEBUG(msg) std::cout << "[Debug] " << msg << std::endl
+    #define LOG_INFO(msg) std::cout << "[Info] " << msg << std::endl
+#else
+    #define LOG_DEBUG(msg)
+    #define LOG_INFO(msg) std::cout << msg << std::endl
+#endif
 
 // Helper functions
 inline void set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-inline void set_socket_buffer_size(int fd, int size) {
-    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size)) < 0) {
-        std::cerr << "Failed to set SO_SNDBUF: " << strerror(errno) << std::endl;
-        return;
-    }
-
-    int actual_size;
-    socklen_t size_len = sizeof(actual_size);
-    if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual_size, &size_len) >= 0) {
-        LOG_INFO("Socket " << fd << " send buffer: " << actual_size << " bytes");
-    }
 }
 
 struct Task {
@@ -86,7 +80,6 @@ public:
 
         // Initialize socket
         set_nonblocking(fd);
-        set_socket_buffer_size(fd, 4096);
 
         // Register for EPOLLIN events
         epoll_event ev{EPOLLIN | EPOLLHUP | EPOLLERR, {.ptr = this}};
@@ -349,7 +342,6 @@ public:
         int opt = 1;
         setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         set_nonblocking(server_fd_);
-        set_socket_buffer_size(server_fd_, 4096);
 
         // Bind and listen
         struct sockaddr_in addr = {
